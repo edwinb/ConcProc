@@ -3,7 +3,7 @@ module Process
 import System.Concurrency.Raw
 import public Data.List -- public, to get proof search machinery
 
-%access public
+%access public export
 
 -- Process IDs are parameterised by their interface. A request of type
 -- 'iface t' will get a response of type 't'
@@ -119,14 +119,14 @@ mutual
      Pure : a -> Process a iface hs (const hs) p (const p)
      Quit : a -> Process a iface hs (const hs) p (const (resetReplied p))
 
-     bind : Process a iface hs hs' p p' -> 
+     Bind : Process a iface hs hs' p p' -> 
             ((x : a) -> Process b iface (hs' x) hs'' (p' x) p'') ->
             Process b iface hs hs'' p p''
 
-     Fork : Process () serveri [] (const []) (runningServer 1) (const doneServer) ->
+     Fork : Process () serveri [] (const []) (runningServer 1) (const Process.doneServer) ->
             Process (ProcID serveri) iface hs (const hs) p (\res => (newServer res p))
      Work : (worker : (pid : ProcID iface) -> Worker [pid] ()) ->
-            (waiter : Process t iface hs (const hs) (runningServer 1) (const doneServer)) ->
+            (waiter : Process t iface hs (const hs) (runningServer 1) (const Process.doneServer)) ->
             Process t iface hs (const hs) p (const p)
 
      Request : (r : ProcID serveri) -> (x : serveri ty) ->
@@ -177,7 +177,7 @@ mutual
   -- responding to requests (i.e. knows it has at least one client connected)
   -- and will not exit unless there are no clients connected
   Running : Type -> (iface : Type -> Type) -> Type
-  Running a iface = {k : Nat} -> Process a iface [] (const []) (runningServer k) (const doneServer)
+  Running a iface = {k : Nat} -> Process a iface [] (const []) (runningServer k) (const Process.doneServer)
 
   Response : Type -> (iface : Type -> Type) -> List (ReqHandle, Type) ->
                      ProcState -> Type
@@ -204,11 +204,11 @@ Lift : IO a -> Process a iface hs (const hs) p (const p)
 Lift = Lift'
      
 %no_implicit -- helps error messages, and speeds things up a bit 
-%inline -- so that the productivity checker treats 'bind' as a constructor!
+%inline -- so that the productivity checker treats 'Bind' as a constructor!
 (>>=) : Process a iface hs hs' p p' -> 
         ((x : a) -> Process b iface (hs' x) hs'' (p' x) p'') ->
         Process b iface hs hs'' p p''
-(>>=) = bind
+(>>=) = Bind
 
 TrySend : (proc : ProcID iface) -> iface ty -> 
           Process (Maybe ty) iface' 
@@ -249,15 +249,15 @@ data Message : (Type -> Type) -> List (ReqHandle, Type) -> Type where
 readMsg : IO (Maybe (Ptr, Message iface hs))
 readMsg {iface} {hs} = 
    do if !checkMsgs
-      then do msg <- getMsgWithSender {a = Message iface hs}
-              pure (Just msg)
+      then do (ptr, _, msg) <- getMsgWithSender {a = Message iface hs}
+              pure (Just (ptr, msg))
       else pure Nothing
 
 readMsgTimeout : Int -> IO (Maybe (Ptr, Message iface hs))
 readMsgTimeout {iface} {hs} i = 
    do if !(checkMsgsTimeout i)
-      then do msg <- getMsgWithSender {a = Message iface hs}
-              pure (Just msg)
+      then do (ptr, _, msg) <- getMsgWithSender {a = Message iface hs}
+              pure (Just (ptr, msg))
       else pure Nothing
 
 data RespEnv : List (ReqHandle, Type) -> Type where
@@ -340,7 +340,9 @@ removeConn cl acc [] = (cl, reverse acc)
 removeConn cl acc ((pid, ConnectMsg) :: xs) 
      = removeConn (cl + 1) acc xs
 removeConn cl acc ((pid, CloseMsg) :: xs) 
-     = removeConn (cl - 1) acc xs
+     = case cl of
+            Z => (cl, acc) -- shouldn't have any queued messages anyway, if zero clients
+            S k => removeConn k acc xs
 removeConn cl acc (x :: xs) = removeConn cl (x :: acc) xs
 
 -- Remove the first thing in the event list which is a request, if it
@@ -348,7 +350,7 @@ removeConn cl acc (x :: xs) = removeConn cl (x :: acc) xs
 getRequest :  EvalState iface hs -> Maybe (Ptr, (ty ** (Nat, iface ty)), EvalState iface hs)
 getRequest (MkEvalState queue reply clients nh) 
      = do (pid, req, queue') <- removeReq [] queue
-          return (pid, req, MkEvalState queue' reply clients nh)
+          pure (pid, req, MkEvalState queue' reply clients nh)
 
 countClients : EvalState iface hs -> (Nat, EvalState iface hs)
 countClients (MkEvalState queue reply clients nh) 
@@ -372,19 +374,20 @@ eval st (Lift' x) k = do x' <- x
                          k x' st
 eval st (Pure x) k = k x st
 eval st (Quit x) k = k x st
-eval st (bind x f) k = eval st x (\x', st' => eval st' (f x') k)
+eval st (Bind x f) k = eval st x (\x', st' => eval st' (f x') k)
 
 eval st (Fork proc) k 
         = do ptr <- fork (eval (MkEvalState [] [] 1 0) proc (\_, _ => pure ()))
              k (MkPID ptr) st 
 
 eval st (Work proc cont) k 
-        = do ptr <- fork (eval (MkEvalState [] [] 0 0) (proc (MkPID prim__vm))
+        = do vm <- getMyVM
+             ptr <- fork (eval (MkEvalState [] [] 0 0) (proc (MkPID vm))
                                (\_, _ => pure ()))
              eval (record { clients = clients st + 1 } st) cont k
 
 eval {hs} (MkEvalState q reqs c nh) (Request (MkPID pid) x) k
-     = do sendToThread pid (MsgQuery {hs} (RequestMsg nh x))
+     = do sendToThread pid 0 (MsgQuery {hs} (RequestMsg nh x))
           k (MkReqH nh) (MkEvalState q (Nothing :: reqs) c (S nh))
 
 eval {p} st (GetReply {pending} h) k 
@@ -408,7 +411,7 @@ eval {iface} {hs} st (TimeoutRespond timeout def f) k
                        (\ r, st''' => 
                             case r of
                                (resp, val) => do
-                                  sendToThread pid (MsgReply {iface} {hs} (ReplyMsg rq resp))
+                                  sendToThread pid 0 (MsgReply {iface} {hs} (ReplyMsg rq resp))
                                   k val st''')
 
 eval {iface} {hs} st (Respond f) k 
@@ -417,18 +420,19 @@ eval {iface} {hs} st (Respond f) k
                 Nothing => eval {iface} st' (Respond f) k
                 Just (pid, (_ ** (rq, req)), st'') => do
                      eval st'' (f req) (\ (resp, val), st''' => do
-                       sendToThread pid (MsgReply {iface} {hs} (ReplyMsg rq resp))
+                       sendToThread pid 0 (MsgReply {iface} {hs} (ReplyMsg rq resp))
                        k val st''')
 
 eval {hs} st (Connect {serveri} (MkPID pid)) k 
-     = if pid == prim__vm then k False st else do
-          v <- sendToThread pid (MsgQuery {iface=serveri} {hs}
+     = do vm <- getMyVM
+          if pid == vm then k False st else do
+            v <- sendToThread pid 0 (MsgQuery {iface=serveri} {hs}
                                           ConnectMsg)
-          -- TODO: Wait for ACK
-          k (v == 1) st
+            -- TODO: Wait for ACK
+            k (v == 1) st
 
 eval {hs} st (Disconnect {serveri} (MkPID pid)) k 
-     = do v <- sendToThread pid (MsgQuery {iface=serveri} {hs} 
+     = do v <- sendToThread pid 0 (MsgQuery {iface=serveri} {hs} 
                                           CloseMsg)
           k () st
 

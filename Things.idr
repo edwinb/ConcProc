@@ -21,12 +21,13 @@ mathsServer : Running () Maths
 mathsServer = do putStrLn "Serving maths!"
                  TimeoutRespond 5 () (\val => case val of
                                                    Factorial k => 
-                                                        Pure (fact k, ()))
+                                                     Pure (fact k, ()))
 --                  Pure ()
                  Loop mathsServer
 
-instance Cast String Nat where
-    cast orig = cast (the Integer (cast orig))
+-- already defined (not sure if same implementation) so commented out:
+--implementation Cast String Nat where
+--    cast orig = cast (the Integer (cast orig))
 
 -- Start up a couple of servers, send them requests
 testProg1 : Program () (const Void)
